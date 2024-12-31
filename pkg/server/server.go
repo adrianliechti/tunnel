@@ -3,7 +3,8 @@ package server
 import (
 	"context"
 	"embed"
-	"errors"
+	"encoding/hex"
+	"fmt"
 	"io/fs"
 	"log/slog"
 	"net"
@@ -14,8 +15,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/gliderlabs/ssh"
-	gossh "golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh"
 )
 
 var (
@@ -26,13 +26,15 @@ var (
 type Server struct {
 	domain string
 
-	sshd  *ssh.Server
-	httpd *http.Server
+	sshPort  int
+	httpPort int
+
+	config *ssh.ServerConfig
 
 	sessions map[string]*Session
 }
 
-func NewServer() *Server {
+func NewServer() (*Server, error) {
 	domain := os.Getenv("DOMAIN")
 	password := os.Getenv("PASSWORD")
 
@@ -40,176 +42,276 @@ func NewServer() *Server {
 		domain = "localhost"
 	}
 
-	s := &Server{
-		domain:   domain,
-		sessions: make(map[string]*Session),
+	config := &ssh.ServerConfig{
+		NoClientAuth: true,
 	}
 
-	s.sshd = &ssh.Server{
-		Addr: ":2222",
+	if password != "" {
+		config.NoClientAuth = false
 
-		Handler: s.handleSession,
-
-		PasswordHandler: func(ctx ssh.Context, pass string) bool {
-			if password == "" {
-				return true
+		config.PasswordCallback = func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+			if string(pass) != password {
+				return nil, fmt.Errorf("password rejected for %q", conn.User())
 			}
 
-			return password == pass
-		},
-
-		PtyCallback: func(ctx ssh.Context, pty ssh.Pty) bool {
-			return false
-		},
-
-		RequestHandlers: map[string]ssh.RequestHandler{
-			"tcpip-forward":        s.handleTCPForward,
-			"cancel-tcpip-forward": s.handleTCPForwardCancel,
-		},
-
-		ReversePortForwardingCallback: ssh.ReversePortForwardingCallback(func(ctx ssh.Context, host string, port uint32) bool {
-			return true
-		}),
+			return &ssh.Permissions{}, nil
+		}
 	}
 
-	s.httpd = &http.Server{
-		Addr: ":2280",
+	hostKey, err := ReadHostKey("")
 
-		Handler: s,
+	if err != nil {
+		return nil, err
 	}
 
-	return s
+	config.AddHostKey(hostKey)
+
+	return &Server{
+		domain: domain,
+		config: config,
+
+		sshPort:  2222,
+		httpPort: 2280,
+
+		sessions: make(map[string]*Session),
+	}, nil
 }
 
 func (s *Server) ListenAndServe() error {
-	result := make(chan error)
+	sshAddr := fmt.Sprintf(":%d", s.sshPort)
+	httpAddr := fmt.Sprintf(":%d", s.httpPort)
 
-	go func() {
-		if err := s.httpd.ListenAndServe(); err != nil {
-			if errors.Is(err, http.ErrServerClosed) {
-				return
-			}
+	go http.ListenAndServe(httpAddr, s)
 
-			result <- err
-		}
-	}()
+	ln, err := net.Listen("tcp", sshAddr)
 
-	go func() {
-		if err := s.sshd.ListenAndServe(); err != nil {
-			if errors.Is(err, ssh.ErrServerClosed) {
-				return
-			}
-
-			result <- err
-		}
-	}()
-
-	return <-result
-}
-
-func (s *Server) Close() error {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
-
-	var result error
-
-	if err := s.httpd.Shutdown(ctx); err != nil {
-		if !errors.Is(err, http.ErrServerClosed) {
-			result = errors.Join(result, err)
-		}
+	if err != nil {
+		return err
 	}
 
-	if err := s.httpd.Close(); err != nil {
-		if !errors.Is(err, http.ErrServerClosed) {
-			result = errors.Join(result, err)
-		}
-	}
+	for {
+		c, err := ln.Accept()
 
-	if err := s.sshd.Shutdown(ctx); err != nil {
-		if !errors.Is(err, ssh.ErrServerClosed) {
-			result = errors.Join(result, err)
+		if err != nil {
+			continue
 		}
 
-	}
-
-	if err := s.sshd.Close(); err != nil {
-		if !errors.Is(err, ssh.ErrServerClosed) {
-			result = errors.Join(result, err)
-		}
-
-	}
-
-	return result
-}
-
-func (s *Server) handleSession(session ssh.Session) {
-	sessionID := session.Context().SessionID()
-
-	go func() {
-		<-session.Context().Done()
-
-		if session, ok := s.sessions[sessionID]; ok {
-			delete(s.sessions, sessionID)
-
-			slog.Info("session closed", "user", session.User, "bind_addr", session.BindAddr, "bind_port", session.BindPort)
-		}
-
-	}()
-
-	for session.Context().Err() == nil {
+		go s.handleConnection(c)
 	}
 }
 
-func (s *Server) handleTCPForward(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (bool, []byte) {
-	conn := ctx.Value(ssh.ContextKeyConn).(*gossh.ServerConn)
+func (s *Server) handleConnection(c net.Conn) {
+	conn, chans, reqs, err := ssh.NewServerConn(c, s.config)
 
-	var payload remoteForwardRequest
-
-	if err := gossh.Unmarshal(req.Payload, &payload); err != nil {
-		return false, []byte{}
+	if err != nil {
+		return
 	}
-
-	if srv.ReversePortForwardingCallback == nil || !srv.ReversePortForwardingCallback(ctx, payload.BindAddr, payload.BindPort) {
-		return false, []byte("port forwarding is disabled")
-	}
-
-	addr := payload.BindAddr
-	port := payload.BindPort
-
-	if port == 0 {
-		port = 80
-	}
-
-	sessionID := ctx.SessionID()
 
 	session := &Session{
+		conn: conn,
+
+		ID:   hex.EncodeToString(conn.SessionID()),
 		User: conn.User(),
 
-		BindAddr: addr,
-		BindPort: int(port),
-
-		conn: conn,
+		Env: make(map[string]string),
 	}
 
-	slog.Info("new session", "user", session.User, "bind_addr", session.BindAddr, "bind_port", session.BindPort)
+	s.sessions[session.ID] = session
 
-	s.sessions[sessionID] = session
+	slog.Debug("connection", "session", session.ID, "user", conn.User(), "remote_addr", conn.RemoteAddr())
 
-	return true, gossh.Marshal(&remoteForwardSuccess{uint32(port)})
+	go func() {
+		for req := range reqs {
+			switch req.Type {
+			case "tcpip-forward":
+				s.handleTCPForward(session, req)
+
+			case "cancel-tcpip-forward":
+				s.cancelTCPForward(session, req)
+
+			case "keepalive@openssh.com":
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+
+			default:
+				slog.Debug("reject request", "type", req.Type)
+
+				if req.WantReply {
+					req.Reply(false, nil)
+				}
+			}
+		}
+	}()
+
+	go func() {
+		for ch := range chans {
+			switch ch.ChannelType() {
+			case "session":
+				go s.handleSession(session, ch)
+
+			default:
+				slog.Debug("reject channel", "type", ch.ChannelType())
+				ch.Reject(ssh.UnknownChannelType, "unknown channel type")
+			}
+		}
+	}()
+
+	conn.Wait()
+
+	delete(s.sessions, session.ID)
 }
 
-func (s *Server) handleTCPForwardCancel(ctx ssh.Context, srv *ssh.Server, req *gossh.Request) (ok bool, payload []byte) {
-	var reqPayload remoteForwardCancelRequest
+func (s *Server) handleSession(session *Session, newChan ssh.NewChannel) {
+	ch, reqs, err := newChan.Accept()
 
-	if err := gossh.Unmarshal(req.Payload, &reqPayload); err != nil {
-		return false, []byte{}
+	if err != nil {
+		return
 	}
 
-	return true, nil
+	_ = ch
+
+	for req := range reqs {
+		switch req.Type {
+		case "pty-req":
+			// https://datatracker.ietf.org/doc/html/rfc4254#section-6.2
+			var payload struct {
+				Term string
+
+				Width uint32
+				Heigh uint32
+
+				WindowWidth  uint32
+				WindowHeight uint32
+
+				TermModes string
+			}
+
+			ssh.Unmarshal(req.Payload, &payload)
+
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+
+		case "env":
+			// https://datatracker.ietf.org/doc/html/rfc4254#section-6.4
+			var payload struct {
+				Key   string
+				Value string
+			}
+
+			ssh.Unmarshal(req.Payload, &payload)
+			slog.Debug("env", "session", session.ID, "key", payload.Key, "value", payload.Value)
+
+			if payload.Key != "" {
+				session.Env[payload.Key] = payload.Value
+			}
+
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		case "shell", "exec":
+			// https://datatracker.ietf.org/doc/html/rfc4254#section-6.5
+			var payload struct {
+				Command string
+			}
+
+			ssh.Unmarshal(req.Payload, &payload)
+			slog.Debug("exec", "session", session.ID, "command", payload.Command)
+
+			session.Cmd = payload.Command
+
+			if req.WantReply {
+				req.Reply(true, nil)
+			}
+
+		case "window-change":
+			// https://datatracker.ietf.org/doc/html/rfc4254#section-6.7
+			var payload struct {
+				Width uint32
+				Heigh uint32
+
+				WindowWidth  uint32
+				WindowHeight uint32
+			}
+
+			ssh.Unmarshal(req.Payload, &payload)
+
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+
+		default:
+			slog.Debug("reject session request", "type", req.Type)
+
+			if req.WantReply {
+				req.Reply(false, nil)
+			}
+		}
+	}
+}
+
+func (s *Server) handleTCPForward(session *Session, req *ssh.Request) {
+	// https://datatracker.ietf.org/doc/html/rfc4254#section-7.1
+	var payload struct {
+		Addr string
+		Port uint32
+	}
+
+	if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+		if req.WantReply {
+			req.Reply(false, nil)
+		}
+
+		return
+	}
+
+	var result []byte
+
+	if payload.Port == 0 {
+		payload.Port = 80
+
+		// https://datatracker.ietf.org/doc/html/rfc4254#section-7.1
+		message := struct {
+			Port uint32
+		}{
+			payload.Port,
+		}
+
+		result = ssh.Marshal(&message)
+	}
+
+	session.BindAddr = payload.Addr
+	session.BindPort = payload.Port
+
+	if req.WantReply {
+		req.Reply(true, result)
+	}
+}
+
+func (s *Server) cancelTCPForward(session *Session, req *ssh.Request) {
+	// https://datatracker.ietf.org/doc/html/rfc4254#section-7.1
+	var payload struct {
+		Addr string
+		Port uint32
+	}
+
+	if err := ssh.Unmarshal(req.Payload, &payload); err != nil {
+		if req.WantReply {
+			req.Reply(false, nil)
+		}
+
+		return
+	}
+
+	if req.WantReply {
+		req.Reply(true, nil)
+	}
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	slog.Info("http request", "host", r.Host, "method", r.Method, "url", r.RequestURI)
+	slog.Info("request", "host", r.Host, "method", r.Method, "url", r.RequestURI)
 
 	host, _ := splitHostPort(r.Host)
 
@@ -226,9 +328,9 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		proxy := &httputil.ReverseProxy{
 			Transport: &http.Transport{
 				DialContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
-					slog.Info("http dial", "host", host, "addr", addr)
+					slog.Debug("dial", "host", host, "addr", addr)
 
-					conn, err := session.Open(ctx, r.RemoteAddr)
+					conn, err := session.Dial(r.RemoteAddr)
 
 					if err != nil {
 						return nil, err
