@@ -81,16 +81,22 @@ func (s *Server) ListenAndServe() error {
 	sshAddr := fmt.Sprintf(":%d", s.sshPort)
 	httpAddr := fmt.Sprintf(":%d", s.httpPort)
 
-	go http.ListenAndServe(httpAddr, s)
-
-	ln, err := net.Listen("tcp", sshAddr)
+	sshListener, err := net.Listen("tcp", sshAddr)
 
 	if err != nil {
 		return err
 	}
 
+	httpListener, err := net.Listen("tcp", httpAddr)
+
+	if err != nil {
+		return err
+	}
+
+	go http.Serve(httpListener, s)
+
 	for {
-		c, err := ln.Accept()
+		c, err := sshListener.Accept()
 
 		if err != nil {
 			continue
@@ -348,6 +354,7 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 			Rewrite: func(r *httputil.ProxyRequest) {
 				r.SetURL(target)
+				r.SetXForwarded()
 			},
 		}
 
