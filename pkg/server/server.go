@@ -345,8 +345,11 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					return conn, nil
 				},
 
-				ForceAttemptHTTP2:     true,
-				MaxIdleConns:          100,
+				ForceAttemptHTTP2: true,
+
+				MaxIdleConns:        100,
+				MaxIdleConnsPerHost: 100,
+
 				IdleConnTimeout:       90 * time.Second,
 				TLSHandshakeTimeout:   10 * time.Second,
 				ExpectContinueTimeout: 1 * time.Second,

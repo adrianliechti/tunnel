@@ -2,7 +2,7 @@ package server
 
 import (
 	"net"
-	"strconv"
+	"net/netip"
 	"time"
 
 	"golang.org/x/crypto/ssh"
@@ -33,11 +33,13 @@ func (s *Session) Dial(remoteAddr string) (net.Conn, error) {
 		ConnectedPort: s.BindPort,
 	}
 
-	if host, portstr, err := net.SplitHostPort(remoteAddr); err == nil {
-		port, _ := strconv.Atoi(portstr)
+	var remote net.Addr
 
-		payload.OriginatorAddr = host
-		payload.OriginatorPort = uint32(port)
+	if val, err := netip.ParseAddrPort(remoteAddr); err == nil {
+		payload.OriginatorAddr = val.Addr().String()
+		payload.OriginatorPort = uint32(val.Port())
+
+		remote = net.TCPAddrFromAddrPort(val)
 	}
 
 	ch, reqs, err := s.conn.OpenChannel("forwarded-tcpip", ssh.Marshal(payload))
@@ -50,6 +52,8 @@ func (s *Session) Dial(remoteAddr string) (net.Conn, error) {
 
 	conn := &connectionWrapper{
 		Channel: ch,
+
+		remote: remote,
 	}
 
 	return conn, nil
