@@ -40,7 +40,11 @@ tunnel.ws {
 Using Tunnel Client:
 
 ```bash
-client -host test.tunnel.ws -port 5173 [ -pass s3cr3t ]
+brew install adrianliechti/tap/tunnel
+```
+
+```bash
+tunnel -host test.tunnel.ws -port 5173 [ -pass s3cr3t ]
 ```
 
 Using SSH Client
