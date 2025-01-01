@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"embed"
+	"encoding/base64"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io/fs"
 	"log/slog"
@@ -16,6 +18,8 @@ import (
 	"time"
 
 	"golang.org/x/crypto/ssh"
+
+	"github.com/adrianliechti/tunnel/pkg/model"
 )
 
 var (
@@ -26,10 +30,11 @@ var (
 type Server struct {
 	domain string
 
-	sshPort  int
-	httpPort int
+	sshPort      int
+	sshConfig    *ssh.ServerConfig
+	sshPublicKey []byte
 
-	config *ssh.ServerConfig
+	httpPort int
 
 	sessions map[string]*Session
 }
@@ -42,14 +47,14 @@ func NewServer() (*Server, error) {
 		domain = "localhost"
 	}
 
-	config := &ssh.ServerConfig{
+	sshConfig := &ssh.ServerConfig{
 		NoClientAuth: true,
 	}
 
 	if password != "" {
-		config.NoClientAuth = false
+		sshConfig.NoClientAuth = false
 
-		config.PasswordCallback = func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
+		sshConfig.PasswordCallback = func(conn ssh.ConnMetadata, pass []byte) (*ssh.Permissions, error) {
 			if string(pass) != password {
 				return nil, fmt.Errorf("password rejected for %q", conn.User())
 			}
@@ -64,13 +69,15 @@ func NewServer() (*Server, error) {
 		return nil, err
 	}
 
-	config.AddHostKey(hostKey)
+	sshConfig.AddHostKey(hostKey)
 
 	return &Server{
 		domain: domain,
-		config: config,
 
-		sshPort:  2222,
+		sshPort:      2222,
+		sshConfig:    sshConfig,
+		sshPublicKey: hostKey.PublicKey().Marshal(),
+
 		httpPort: 2280,
 
 		sessions: make(map[string]*Session),
@@ -107,7 +114,7 @@ func (s *Server) ListenAndServe() error {
 }
 
 func (s *Server) handleConnection(c net.Conn) {
-	conn, chans, reqs, err := ssh.NewServerConn(c, s.config)
+	conn, chans, reqs, err := ssh.NewServerConn(c, s.sshConfig)
 
 	if err != nil {
 		return
@@ -365,8 +372,29 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fs, _ := fs.Sub(public, "public")
-	http.FileServerFS(fs).ServeHTTP(w, r)
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("GET /config", func(w http.ResponseWriter, r *http.Request) {
+		data := model.Config{
+			URL: fmt.Sprintf("https://%s", s.domain),
+
+			SSH: &model.SSHConfig{
+				Host: fmt.Sprintf("%s:%d", s.domain, s.sshPort),
+
+				PublicKey: base64.StdEncoding.EncodeToString(s.sshPublicKey),
+			},
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(data)
+	})
+
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		fs, _ := fs.Sub(public, "public")
+		http.FileServerFS(fs).ServeHTTP(w, r)
+	})
+
+	mux.ServeHTTP(w, r)
 }
 
 func (s *Server) sessionByHost(val string) (*Session, bool) {

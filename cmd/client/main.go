@@ -1,12 +1,17 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/url"
 	"strings"
 
+	"github.com/adrianliechti/tunnel/pkg/model"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -14,13 +19,11 @@ func main() {
 	var host string
 	var port int
 
-	var user string
 	var pass string
 
 	flag.StringVar(&host, "host", "", "public hostname")
 	flag.IntVar(&port, "port", 0, "local port to tunnel")
 
-	flag.StringVar(&user, "user", "tunnel", "username")
 	flag.StringVar(&pass, "pass", "", "password")
 
 	flag.Parse()
@@ -39,20 +42,38 @@ func main() {
 		panic("invalid host")
 	}
 
-	server := strings.Join(parts[1:], ".") + ":2222"
-	target := fmt.Sprintf("localhost:%d", port)
+	host = parts[0]
+	bootstrap := strings.Join(parts[1:], ".")
 
-	config := &ssh.ClientConfig{
-		User: user,
+	config, err := loadConfig(bootstrap)
 
-		Auth: []ssh.AuthMethod{
-			ssh.Password(pass),
-		},
+	if err != nil {
+		panic(err)
+	}
+
+	addr := fmt.Sprintf("localhost:%d", port)
+
+	publicURL, _ := url.Parse(config.URL)
+	publicURL.Host = host + "." + publicURL.Host
+
+	sshHost := config.SSH.Host
+	sshPublicKey := mustPublicKey(config.SSH.PublicKey)
+
+	sshConfig := &ssh.ClientConfig{
+		User: "tunnel",
 
 		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
 	}
 
-	client, err := ssh.Dial("tcp", server, config)
+	if pass != "" {
+		sshConfig.Auth = append(sshConfig.Auth, ssh.Password(pass))
+	}
+
+	if sshPublicKey != nil {
+		sshConfig.HostKeyCallback = ssh.FixedHostKey(sshPublicKey)
+	}
+
+	client, err := ssh.Dial("tcp", sshHost, sshConfig)
 
 	if err != nil {
 		panic(err)
@@ -74,7 +95,7 @@ func main() {
 		panic("failed to forward port")
 	}
 
-	fmt.Printf("forwarding https://%s -> http://%s\n", host, target)
+	fmt.Printf("forwarding %s -> http://%s\n", publicURL, addr)
 
 	go func() {
 		for c := range client.HandleChannelOpen("forwarded-tcpip") {
@@ -87,7 +108,7 @@ func main() {
 
 				go ssh.DiscardRequests(reqs)
 
-				local, err := net.Dial("tcp", target)
+				local, err := net.Dial("tcp", addr)
 
 				if err != nil {
 					return
@@ -100,4 +121,52 @@ func main() {
 	}()
 
 	client.Wait()
+}
+
+func loadConfig(rawURL string) (*model.Config, error) {
+	if !strings.HasPrefix(rawURL, "http") && !strings.HasPrefix(rawURL, "https") {
+		rawURL = "https://" + rawURL
+	}
+
+	u, err := url.Parse(rawURL)
+
+	if err != nil {
+		return nil, err
+	}
+
+	if u.Path == "" {
+		u.Path = "/config"
+	}
+
+	resp, err := http.Get(u.String())
+
+	if err != nil {
+		return nil, err
+	}
+
+	defer resp.Body.Close()
+
+	var config model.Config
+
+	if err := json.NewDecoder(resp.Body).Decode(&config); err != nil {
+		return nil, err
+	}
+
+	return &config, nil
+}
+
+func mustPublicKey(s string) ssh.PublicKey {
+	data, err := base64.StdEncoding.DecodeString(s)
+
+	if err != nil {
+		panic(err)
+	}
+
+	key, err := ssh.ParsePublicKey(data)
+
+	if err != nil {
+		panic(err)
+	}
+
+	return key
 }
