@@ -11,10 +11,15 @@ import (
 
 func main() {
 	slog.SetDefault(slog.New(tint.NewHandler(os.Stderr, &tint.Options{
-		Level:      slog.LevelInfo,
+		Level:      slog.LevelDebug,
 		TimeFormat: time.Kitchen,
 	})))
 
-	s := server.NewServer()
+	s, err := server.NewServer()
+
+	if err != nil {
+		panic(err)
+	}
+
 	panic(s.ListenAndServe())
 }
