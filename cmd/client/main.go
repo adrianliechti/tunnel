@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/http"
 	"net/url"
+	"os"
 	"strings"
 
 	"github.com/adrianliechti/tunnel/pkg/model"
@@ -21,10 +22,16 @@ func main() {
 
 	var pass string
 
+	var https bool
+	var hostname string
+
 	flag.StringVar(&host, "host", "", "public hostname")
 	flag.IntVar(&port, "port", 0, "local port to tunnel")
 
 	flag.StringVar(&pass, "pass", "", "password")
+
+	flag.BoolVar(&https, "https", false, "connect using https")
+	flag.StringVar(&hostname, "hostname", "", "hostname header")
 
 	flag.Parse()
 
@@ -80,6 +87,29 @@ func main() {
 	}
 
 	defer client.Close()
+
+	session, err := client.NewSession()
+
+	if err != nil {
+		panic(err)
+	}
+
+	session.Stdout = os.Stdout
+	session.Stderr = os.Stderr
+
+	cmd := "tunnel"
+
+	if https {
+		cmd += " -proto https"
+	}
+
+	if hostname != "" {
+		cmd += " -hostname " + hostname
+	}
+
+	if err := session.Start(cmd); err != nil {
+		panic(err)
+	}
 
 	forwardMessage := struct {
 		BindAddr string

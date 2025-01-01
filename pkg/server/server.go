@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/anmitsu/go-shlex"
 	"golang.org/x/crypto/ssh"
 
 	"github.com/adrianliechti/tunnel/pkg/model"
@@ -233,7 +234,23 @@ func (s *Server) handleSession(session *Session, newChan ssh.NewChannel) {
 			ssh.Unmarshal(req.Payload, &payload)
 			slog.Debug("exec", "session", session.ID, "command", payload.Command)
 
-			session.Cmd = payload.Command
+			cmd := strings.TrimSpace(payload.Command)
+			args, err := shlex.Split(cmd, true)
+
+			if err != nil {
+				if req.WantReply {
+					req.Reply(true, nil)
+				}
+				return
+			}
+
+			if len(args) > 0 {
+				session.Cmd = args[0]
+			}
+
+			if len(args) > 1 {
+				session.Args = args[1:]
+			}
 
 			if req.WantReply {
 				req.Reply(true, nil)
@@ -329,14 +346,25 @@ func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	host, _ := splitHostPort(r.Host)
 
 	if strings.HasSuffix(host, "."+s.domain) {
-		target, _ := url.Parse("http://" + r.Host)
-
 		session, ok := s.sessionByHost(host)
 
 		if !ok {
 			w.WriteHeader(http.StatusNotFound)
 			return
 		}
+
+		proto := "http"
+		hostname := r.Host
+
+		if val := session.Arg("proto"); val != "" {
+			proto = val
+		}
+
+		if val := session.Arg("hostname"); val != "" {
+			hostname = val
+		}
+
+		target, _ := url.Parse(proto + "://" + hostname)
 
 		proxy := &httputil.ReverseProxy{
 			Transport: &http.Transport{

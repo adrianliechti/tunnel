@@ -12,8 +12,9 @@ type Session struct {
 	ID   string
 	User string
 
-	Env map[string]string
-	Cmd string
+	Env  map[string]string
+	Cmd  string
+	Args []string
 
 	BindAddr string
 	BindPort uint32
@@ -74,6 +75,16 @@ func (s *Session) Exit(code int) error {
 	}
 
 	return s.conn.Close()
+}
+
+func (s *Session) Arg(name string) string {
+	for i := 0; i < len(s.Args); i++ {
+		if s.Args[i] == "-"+name && len(s.Args) > i {
+			return s.Args[i+1]
+		}
+	}
+
+	return ""
 }
 
 type connectionWrapper struct {
